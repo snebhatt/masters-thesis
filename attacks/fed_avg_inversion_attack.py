@@ -11,17 +11,45 @@ from .priors import _joint_gmm_prior, _mean_field_gmm_prior, _categorical_prior,
 from .inversion_losses import _weighted_CS_SE_loss, _gradient_norm_weighted_CS_SE_loss, _squared_error_loss, _cosine_similarity_loss
 from .ensembling import pooled_ensemble
 from collections import OrderedDict
-from models import MetaMonkey
+from models.monkey import MetaMonkey
 import numpy as np
 import copy
 import pickle
 import os
 import multiprocessing
-
+from defenses.dp_defense import dp_defense
+from utils.dirichlet_dist import dirichlet_distribution
 
 def caller(x):
     return os.system(x)
 
+def compute_soteria_mask(model, inputs, pruning_rate=30.0, device='cpu'):
+    model.zero_grad()
+    ground_truth = inputs.clone().detach().requires_grad_(True).to(device)
+    feature_fc1_graph = model.extract_feature(ground_truth)
+    deviation_f1_target = torch.zeros_like(feature_fc1_graph)
+    deviation_f1_x_norm = torch.zeros_like(feature_fc1_graph)
+    for f in range(deviation_f1_x_norm.size(1)):
+        deviation_f1_target[:, f] = 1
+        feature_fc1_graph.backward(deviation_f1_target, retain_graph=True)
+        deviation_f1_x = ground_truth.grad.data
+        deviation_f1_x_norm[:, f] = torch.norm(deviation_f1_x.view(deviation_f1_x.size(0), -1), dim=1)
+        model.zero_grad()
+        ground_truth.grad.data.zero_()
+        deviation_f1_target[:, f] = 0
+    deviation_f1_x_norm_sum = deviation_f1_x_norm.sum(axis=0)
+    thresh = np.percentile(deviation_f1_x_norm_sum.flatten().cpu().numpy(), pruning_rate)
+    mask = np.where(abs(deviation_f1_x_norm_sum.cpu().numpy()) < thresh, 0, 1).astype(np.float32)
+    mask = torch.tensor(mask, dtype=feature_fc1_graph.dtype, device=feature_fc1_graph.device)
+    
+    return mask
+
+
+
+def unbiased_random(grad, a):
+    dim = grad.numel()
+    compressed = random(grad, a)
+    return (dim / a) * compressed
 
 def epoch_matching_prior_mean_square_error(epoch_data, device=None):
     """
@@ -140,7 +168,13 @@ def simulate_local_training_for_attack(client_net, lr, criterion, dataset, label
             grad = torch.autograd.grad(training_loss, client_net.parameters.values(), retain_graph=True,
                                        create_graph=True, only_inputs=True, allow_unused=True)
 
-            client_net.parameters = OrderedDict((name, param - lr * param_grad) for ((name, param), param_grad) in zip(client_net.parameters.items(), grad))
+            new_params = OrderedDict()
+            for (name, param), param_grad in zip(client_net.parameters.items(), grad):
+                if param_grad is not None:
+                    new_params[name] = param - lr * param_grad
+                else:
+                    new_params[name] = param  # No update if grad is None
+            client_net.parameters = new_params
 
             # keep track of a regularizer if needed
             if priors is not None:
@@ -396,7 +430,7 @@ def train_and_attack_fed_avg(net, n_clients, n_global_epochs, n_local_epochs, lo
                              pooling=None, perfect_pooling=False, initialization_mode='uniform', softmax_trick=True,
                              gumbel_softmax_trick=False, sigmoid_trick=False, temperature_mode='constant',
                              sign_trick=True, fish_for_features=None, device=None, verbose=False, max_n_cpus=50, first_cpu=0,
-                             max_client_dataset_size=None, parallelized=False, metadata_path='metadata'):
+                             max_client_dataset_size=None, parallelized=False, metadata_path='metadata', dp_defense=False,        strong_defense=False, soteria=False, non_iid=False):
     """
     Train a network using federated averaging while also attacking a subset of the clients at each global epoch,
     simulating a real world data fishing scenario.
@@ -453,6 +487,9 @@ def train_and_attack_fed_avg(net, n_clients, n_global_epochs, n_local_epochs, lo
     :param metadata_path: (str) If the process is parallelized over clients, the metadata during the process will be
         saved here.
     """
+    
+    datset = dirichlet_distribution(dataset, n_clients)
+    
     if device is None:
         device = dataset.device
 
@@ -468,14 +505,18 @@ def train_and_attack_fed_avg(net, n_clients, n_global_epochs, n_local_epochs, lo
     per_global_epoch_per_client_reconstructions = []
     per_global_epoch_per_client_ground_truth = []
     training_data = np.zeros((n_global_epochs, 2))
-
-    # get the data and then split it into client datasets
-    if shuffle:
-        dataset.shuffle()
-    Xtrain, ytrain = dataset.get_Xtrain(), dataset.get_ytrain()
-    split_size = min(max_client_dataset_size, int(np.ceil(Xtrain.size()[0] / n_clients)))  # ceiling
-    Xtrain_splits = [Xtrain[i*split_size:min(int(Xtrain.size()[0]), (i+1)*split_size)].clone().detach() for i in range(n_clients)]
-    ytrain_splits = [ytrain[i*split_size:min(int(Xtrain.size()[0]), (i+1)*split_size)].clone().detach() for i in range(n_clients)]
+    
+    
+    if non_iid:
+        Xtrain_splits, ytrain_splits = zip(*make_non_iid_by_dirichlet(dataset, n_clients, alpha=0.3))
+    else:
+        # get the data and then split it into client datasets
+        if shuffle:
+            dataset.shuffle()
+        Xtrain, ytrain = dataset.get_Xtrain(), dataset.get_ytrain()
+        split_size = min(max_client_dataset_size, int(np.ceil(Xtrain.size()[0] / n_clients)))  # ceiling
+        Xtrain_splits = [Xtrain[i*split_size:min(int(Xtrain.size()[0]), (i+1)*split_size)].clone().detach() for i in range(n_clients)]
+        ytrain_splits = [ytrain[i*split_size:min(int(Xtrain.size()[0]), (i+1)*split_size)].clone().detach() for i in range(n_clients)]
 
     # instantiate the loss
     criterion = torch.nn.CrossEntropyLoss()
@@ -505,15 +546,63 @@ def train_and_attack_fed_avg(net, n_clients, n_global_epochs, n_local_epochs, lo
                 for b in range(n_batches):
                     current_batch_X = client_X[b * local_batch_size:min(int(client_X.size()[0]), (b+1)*local_batch_size)].clone().detach()
                     current_batch_y = client_y[b * local_batch_size:min(int(client_X.size()[0]), (b+1)*local_batch_size)].clone().detach()
+                    
+                    if soteria:
+                        feature_mask = compute_soteria_mask(client_net, current_batch_X, pruning_rate=50.0, device=device)
+                    else:
+                        feature_mask = None
 
-                    outputs = client_net(current_batch_X)
+                    outputs = client_net(current_batch_X, feature_mask=feature_mask)
                     loss = criterion(outputs, current_batch_y)
-                    grad = torch.autograd.grad(loss, client_net.parameters(), retain_graph=True)
+                    grad = torch.autograd.grad(loss, client_net.parameters(), retain_graph=True, allow_unused=True)
+               
+                    
+                    if dp_defense:
+                            CDP_configs = {
+                                'G': 1,
+                                'n_iters': 200,
+                                'delta': 1e-3,
+                                'epsilon': 2,
+                                'm' : client_X.size()[0]
+                            }
+
+                            compression_param = max(1, grad[0].numel() // 20)  # Ensure at least 1 element is kept
+
+                            perturbation_variance = np.sqrt(
+                                8 * CDP_configs['G']**2 * CDP_configs['n_iters'] * (-np.log(CDP_configs['delta']))
+                                / (CDP_configs['m']**2 * CDP_configs['epsilon']**2)
+                            ) # calculated as per Soteria CDP
+                            
+                                                   
+                            G_tensor = torch.tensor(CDP_configs['G'], dtype=torch.float32, device='cpu') # for clipping converted scalar to tensor
+                            grad = list(grad) # convert grad tuple to list
+
+                            for i in range(len(grad)):
+                                g = grad[i]
+                                grad_norm = g.pow(2).sum().sqrt() # L2 norm
+                                grad_norm = torch.max(grad_norm, torch.tensor(1e-10, dtype=grad_norm.dtype, device=grad_norm.device))
+                                grad[i] = g * (1 / torch.max(torch.ones_like(grad_norm), grad_norm / G_tensor))
+
+                            grad = tuple(grad)
+                            
+                                              
+                            # Adding Gaussian noise for differential privacy
+                            if perturbation_variance is not None:
+                                noise = [torch.tensor(np.random.randn(*g.shape) * perturbation_variance, dtype=g.dtype, device=g.device) for g in grad]
+                                grad = [g + n for g, n in zip(grad, noise)]
+                               
+                            
+                            if strong_defense:
+                                 grad = tuple(unbiased_random(g, compression_param) for g in grad)
 
                     with torch.no_grad():
                         for param, param_grad in zip(client_net.parameters(), grad):
-                            param -= lr * param_grad
-
+                            if param_grad is not None:
+                                param -= lr * param_grad
+        
+        
+                
+        
         # extract the parameters from the client nets
         clients_params = [[param.clone().detach() for param in client_net.parameters()] for client_net in client_nets]
 
@@ -618,5 +707,8 @@ def train_and_attack_fed_avg(net, n_clients, n_global_epochs, n_local_epochs, lo
         
         timer.end()
     timer.duration()
+    '''acc, bac = get_acc_and_bac(client_net, dataset.get_Xtest(), dataset.get_ytest())
+    pre, f1, recall = get_pre_f1_recall(client_net, dataset.get_Xtest(), dataset.get_ytest())
+    print(f'    Acc: {acc * 100:.2f}%    BAcc: {bac * 100:.2f}%') '''
 
     return net, training_data, per_global_epoch_per_client_reconstructions, per_global_epoch_per_client_ground_truth

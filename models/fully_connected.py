@@ -32,10 +32,10 @@ class FullyConnected(nn.Module):
     """
 
     def __init__(self, input_size, layout):
-
         super(FullyConnected, self).__init__()
         layers = [nn.Flatten()]  # does not play any role, but makes the code neater
         prev_fc_size = input_size
+        self.n_hidden = len(layout) - 1  # Save number of hidden layers
         for i, fc_size in enumerate(layout):
             if i + 1 < len(layout):
                 layers += [LinReLU(prev_fc_size, fc_size)]
@@ -44,8 +44,23 @@ class FullyConnected(nn.Module):
             prev_fc_size = fc_size
         self.layers = nn.Sequential(*layers)
 
-    def forward(self, x):
-        x = self.layers(x)
+    def forward(self, x, feature_mask=None):
+        # Forward through all layers except the last (output) layer
+        for i in range(self.n_hidden):  # Flatten + hidden layers
+            x = self.layers[i](x)
+        # x is now the feature representation before the defended layer
+        if feature_mask is not None:
+            if feature_mask.dim() == 1:
+                feature_mask = feature_mask.unsqueeze(0)
+            feature_mask = feature_mask.to(x.device)
+            x = x * feature_mask  # Broadcasting will work if shapes match
+        # Pass through the output layer
+        x = self.layers[-1](x)
+        return x
+    
+    def extract_feature(self, x):
+        for i in range(self.n_hidden):  # +1 for Flatten
+            x = self.layers[i](x)
         return x
 
 
@@ -136,4 +151,3 @@ class FullyConnectedTrainer:
             print('Finished Training')
         if testx is not None and testy is not None:
             return accs, baccs
-

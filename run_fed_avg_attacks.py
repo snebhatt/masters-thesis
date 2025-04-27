@@ -2,7 +2,7 @@ import os
 import attacks
 import numpy as np
 import torch
-from utils import match_reconstruction_ground_truth, Timer, post_process_continuous
+from utils import match_reconstruction_ground_truth, Timer, post_process_continuous, get_acc_and_bac
 from attacks import train_and_attack_fed_avg
 from models import FullyConnected
 from datasets import ADULT, Lawschool, HealthHeritage, German
@@ -11,7 +11,8 @@ import argparse
 
 def calculate_fed_avg_local_dataset_inversion_performance(architecture_layout, dataset, max_client_dataset_size,
                                                           local_epochs, local_batch_sizes, epoch_prior_params,
-                                                          tolerance_map, n_samples, config, max_n_cpus, first_cpu, device):
+                                                          tolerance_map, n_samples, config, max_n_cpus, first_cpu, device, dp_defense,  strong_defense, soteria, non_iid):
+    
     collected_data = np.zeros((len(local_epochs), len(local_batch_sizes), len(epoch_prior_params), 3, 5))
 
     timer = Timer(len(local_epochs) * len(local_batch_sizes) * len(epoch_prior_params))
@@ -58,9 +59,12 @@ def calculate_fed_avg_local_dataset_inversion_performance(architecture_layout, d
                     max_n_cpus=max_n_cpus,
                     first_cpu=first_cpu,
                     device=device,
-                    verbose=False,
+                    verbose=True,
                     max_client_dataset_size=max_client_dataset_size,
-                    parallelized=True
+                    parallelized=True,
+                    dp_defense=dp_defense,
+                    strong_defense=strong_defense,
+                    soteria=soteria
                 )
 
                 # calculate the inversion error
@@ -86,6 +90,7 @@ def calculate_fed_avg_local_dataset_inversion_performance(architecture_layout, d
 
             best_param_index = np.argmin(collected_data[i, j, :, 0, 0]).item()
             print(f'Performance at {lepochs} Epochs and {lbatch_size} Batch Size: {100*(1-collected_data[i, j, best_param_index, 0, 0]):.1f}% +- {100*collected_data[i, j, best_param_index, 0, 1]:.2f}')
+     
 
     return collected_data
 
@@ -129,7 +134,7 @@ def main(args):
         # TabLeak
         52: {
             'n_global_epochs': 1,
-            'lr': 0.01,
+            'lr': 0.1,
             'shuffle': True,
             'attacked_clients': 'all',
             'attack_iterations': 1500,
@@ -147,9 +152,9 @@ def main(args):
             'sigmoid_trick': True,
             'temperature_mode': 'constant',
             'sign_trick': True,
-            'verbose': False,
+            'verbose': True,
             'max_client_dataset_size': 32,
-            'post_process_cont': False
+            'post_process_cont': True
         }
     }
 
@@ -193,7 +198,11 @@ def main(args):
             config=config,
             max_n_cpus=args.max_n_cpus,
             first_cpu=args.first_cpu,
-            device=args.device
+            device=args.device,
+            dp_defense=args.dp_defense,
+            strong_defense=args.strong_defense,
+            soteria=args.soteria,
+            non_iid=args.non_iid
         )
         np.save(specific_file_path, inversion_data)
     print('Complete                           ')
@@ -209,5 +218,9 @@ if __name__ == '__main__':
     parser.add_argument('--first_cpu', type=int, default=0, help='The first cpu in the pool')
     parser.add_argument('--force', action='store_true', help='If set to true, this will force the program to redo a given experiment')
     parser.add_argument('--device', type=str, default='cpu', help='Select the device to run the program on')
+    parser.add_argument('--dp_defense', action='store_true', help='If set to true, this will add dp defense')
+    parser.add_argument('--strong_defense', action='store_true', help='If set to true, this will add dp + compression defense')
+    parser.add_argument('--soteria', action='store_true', help='If set to true, this will soteria defense')
+    parser.add_argument('--non_iid', action='store_true', help='If set to true, this will transform the dataset into non IID')
     in_args = parser.parse_args()
     main(in_args)
