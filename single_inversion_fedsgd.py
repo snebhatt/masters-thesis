@@ -6,6 +6,7 @@ from defenses import dp_defense
 import pickle
 import numpy as np
 import argparse
+from attacks.fed_avg_inversion_attack import compute_soteria_mask
 
 
 def main(args):
@@ -19,6 +20,7 @@ def main(args):
         config = pickle.load(f)
     with open(f'{args.metadata_path}/dataset.pickle', 'rb') as f:
         dataset = pickle.load(f)
+     
 
     if 'lr_scheduler' not in config:
         config['lr_scheduler'] = False
@@ -45,12 +47,19 @@ def main(args):
     batchindices = torch.tensor(np.random.randint(Xtrain.size()[0], size=args.batch_size)).to(args.device)
     target_batch = Xtrain[batchindices].clone().detach()
     target_batch_labels = ytrain[batchindices].clone().detach()
+    
+    if soteria:
+        feature_mask = compute_soteria_mask(net, target_batch, pruning_rate=args.pruning, device=device)
+    else:
+        feature_mask = None
+        
     if bn_prior_present:
-        output, true_bn_stats_attached = net(target_batch, return_bn_stats=True)
+        output, true_bn_stats_attached = net(target_batch, return_bn_stats=True, feature_mask=feature_mask)
         true_bn_stats = [(bn_mean.detach(), bn_var.detach()) for bn_mean, bn_var in true_bn_stats_attached]
     else:
-        output = net(target_batch)
+        output = net(target_batch, feature_mask=feature_mask)
         true_bn_stats = None
+            
     target_loss = criterion(output, target_batch_labels)
     input_gradient = torch.autograd.grad(target_loss, net.parameters())
     input_gradient = [grad.detach() for grad in input_gradient]
@@ -69,7 +78,7 @@ def main(args):
         input_gradient = dp_defense(in_grad=input_gradient, scale=args.dp_scale,
                                     noise_distribution=config['dp_noise_distribution'])
         args.metadata_path = args.metadata_path + f'/scale_{args.dp_scale}'
-
+        
     if args.brute_force_labels:
         label_counts = restore_labels(net=net, input_size=target_batch.size(), gradients=input_gradient,
                                       post_process=True, device=args.device)[1]
@@ -182,5 +191,7 @@ if __name__ == '__main__':
     parser.add_argument('--dp_defense', action='store_true', help='Toggle to conduct DP defense')
     parser.add_argument('--dp_scale', type=float, help='Scale of the DP')
     parser.add_argument('--device', type=str, default='cpu', help='Select the device to run the program on')
+    parser.add_argument('--soteria', action='store_true', help='Enable soteria defense')
+    parser.add_argument('--pruning', type=float, help='Pruning rate')
     in_args = parser.parse_args()
     main(in_args)
